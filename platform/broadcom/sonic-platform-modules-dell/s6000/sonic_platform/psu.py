@@ -11,10 +11,15 @@
 
 try:
     import os
+    import glob
     from sonic_platform_base.psu_base import PsuBase
     from sonic_platform.eeprom import Eeprom
+    from sonic_platform.fan import Fan
+    from sonic_platform.thermal import Thermal
 except ImportError as e:
     raise ImportError(str(e) + "- required module not found")
+
+MAX_S6000_THERMALS_PER_PSU = 2
 
 
 class Psu(PsuBase):
@@ -24,16 +29,25 @@ class Psu(PsuBase):
     I2C_DIR = "/sys/class/i2c-adapter/"
 
     def __init__(self, psu_index):
+        PsuBase.__init__(self)
         # PSU is 1-based in DellEMC platforms
         self.index = psu_index + 1
         self.psu_presence_reg = "psu{}_prs".format(psu_index)
         self.psu_status_reg = "powersupply_status"
+        self.is_driver_initialized = False
 
         if self.index == 1:
             ltc_dir = self.I2C_DIR + "i2c-11/11-0042/hwmon/"
         else:
             ltc_dir = self.I2C_DIR + "i2c-11/11-0040/hwmon/"
-        hwmon_node = os.listdir(ltc_dir)[0]
+
+        try:
+            hwmon_node = os.listdir(ltc_dir)[0]
+        except OSError:
+            hwmon_node = "hwmon*"
+        else:
+            self.is_driver_initialized = True
+
         self.HWMON_DIR = ltc_dir + hwmon_node + '/'
 
         self.psu_voltage_reg = self.HWMON_DIR + "in1_input"
@@ -42,9 +56,10 @@ class Psu(PsuBase):
 
         self.eeprom = Eeprom(is_psu=True, psu_index=self.index)
 
-        # Overriding _fan_list class variable defined in PsuBase, to
-        # make it unique per Psu object
-        self._fan_list = []
+        self._fan_list.append(Fan(psu_index=self.index, psu_fan=True, dependency=self))
+        for i in range(1, MAX_S6000_THERMALS_PER_PSU+1):
+            self._thermal_list.append(Thermal(psu_index=self.index, thermal_index=i,
+                                              psu_thermal=True, dependency=self))
 
     def _get_cpld_register(self, reg_name):
         # On successful read, returns the value read from given
@@ -70,6 +85,14 @@ class Psu(PsuBase):
         # reg_name and on failure returns 'ERR'
         rv = 'ERR'
 
+        if not self.is_driver_initialized:
+            reg_file_path = glob.glob(reg_file)
+            if len(reg_file_path):
+                reg_file = reg_file_path[0]
+                self._get_sysfs_path()
+            else:
+                return rv
+
         if (not os.path.isfile(reg_file)):
             return rv
 
@@ -82,6 +105,17 @@ class Psu(PsuBase):
         rv = rv.rstrip('\r\n')
         rv = rv.lstrip(" ")
         return rv
+
+    def _get_sysfs_path(self):
+        voltage_reg = glob.glob(self.psu_voltage_reg)
+        current_reg = glob.glob(self.psu_current_reg)
+        power_reg = glob.glob(self.psu_power_reg)
+
+        if len(voltage_reg) and len(current_reg) and len(power_reg):
+            self.psu_voltage_reg = voltage_reg[0]
+            self.psu_current_reg = current_reg[0]
+            self.psu_power_reg = power_reg[0]
+            self.is_driver_initialized = True
 
     def get_name(self):
         """
@@ -115,7 +149,7 @@ class Psu(PsuBase):
         Returns:
             string: Part number of PSU
         """
-        return self.eeprom.part_number_str()
+        return self.eeprom.get_part_number()
 
     def get_serial(self):
         """
@@ -125,7 +159,16 @@ class Psu(PsuBase):
             string: Serial number of PSU
         """
         # Sample Serial number format "US-01234D-54321-25A-0123-A00"
-        return self.eeprom.serial_number_str()
+        return self.eeprom.get_serial_number()
+
+    def get_revision(self):
+        """
+        Retrieves the hardware revision of the device
+
+        Returns:
+            string: Revision value of device
+        """
+        return self.eeprom.get_revision()
 
     def get_status(self):
         """
@@ -137,11 +180,28 @@ class Psu(PsuBase):
         status = False
         psu_status = self._get_cpld_register(self.psu_status_reg)
         if (psu_status != 'ERR'):
-            psu_status = (int(psu_status, 16) >> ((2 - self.index) * 4)) & 0xF
+            psu_status = (int(psu_status, 16) >> int((2 - self.index) * 4)) & 0xF
             if (~psu_status & 0b1000) and (~psu_status & 0b0100):
                 status = True
 
         return status
+
+    def get_position_in_parent(self):
+        """
+        Retrieves 1-based relative physical position in parent device.
+        Returns:
+            integer: The 1-based relative physical position in parent
+            device or -1 if cannot determine the position
+        """
+        return self.index
+
+    def is_replaceable(self):
+        """
+        Indicate whether PSU is replaceable.
+        Returns:
+            bool: True if it is replaceable.
+        """
+        return True
 
     def get_voltage(self):
         """
@@ -197,6 +257,21 @@ class Psu(PsuBase):
 
         return psu_power
 
+    def get_maximum_supplied_power(self):
+        """
+        Retrieves the maximum supplied power by PSU
+
+        Returns:
+            A float number, the maximum power output in Watts.
+            e.g. 1200.1
+        """
+        if self.get_presence():
+            psu_maxpower = 460.0
+        else:
+            psu_maxpower = 0.0
+
+        return psu_maxpower
+
     def get_powergood_status(self):
         """
         Retrieves the powergood status of PSU
@@ -238,3 +313,50 @@ class Psu(PsuBase):
         # In S6000, the firmware running in the PSU controls the LED
         # and the PSU LED state cannot be changed from CPU.
         return False
+
+    def get_temperature(self):
+        """
+        Retrieves current temperature reading from PSU
+
+        Returns:
+            A float number of current temperature in Celsius up to
+            nearest thousandth of one degree Celsius, e.g. 30.125
+        """
+        if self.get_presence():
+            return self.get_thermal(0).get_temperature()
+        else:
+            return 0.0
+
+    def get_temperature_high_threshold(self):
+        """
+        Retrieves the high threshold temperature of PSU
+
+        Returns:
+            A float number, the high threshold temperature of PSU in
+            Celsius up to nearest thousandth of one degree Celsius,
+            e.g. 30.125
+        """
+        if self.get_presence():
+            return self.get_thermal(0).get_high_threshold()
+        else:
+            return 0.0
+
+    def get_voltage_high_threshold(self):
+        """
+        Retrieves the high threshold PSU voltage output
+
+        Returns:
+            A float number, the high threshold output voltage in volts,
+            e.g. 12.1
+        """
+        return 12.6
+
+    def get_voltage_low_threshold(self):
+        """
+        Retrieves the low threshold PSU voltage output
+
+        Returns:
+            A float number, the low threshold output voltage in volts,
+            e.g. 12.1
+        """
+        return 11.4

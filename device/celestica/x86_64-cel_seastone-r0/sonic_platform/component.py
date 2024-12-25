@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 #############################################################################
 # Celestica
 #
@@ -8,14 +6,12 @@
 #
 #############################################################################
 
-import json
 import os.path
 import shutil
-import shlex
-import subprocess
 
 try:
     from sonic_platform_base.component_base import ComponentBase
+    from .helper import APIHelper
 except ImportError as e:
     raise ImportError(str(e) + "- required module not found")
 
@@ -28,8 +24,11 @@ CPLD_ADDR_MAPPING = {
 }
 GETREG_PATH = "/sys/devices/platform/dx010_cpld/getreg"
 BIOS_VERSION_PATH = "/sys/class/dmi/id/bios_version"
-COMPONENT_NAME_LIST = ["CPLD1", "CPLD2", "CPLD3", "CPLD4", "BIOS"]
-COMPONENT_DES_LIST = ["CPLD1", "CPLD2", "CPLD3", "CPLD4", "Basic Input/Output System"]
+COMPONENT_NAME_LIST = ["CPLD1", "CPLD2", "CPLD3", "CPLD4", "CPLD5", "BIOS"]
+COMPONENT_DES_LIST = ["Used for managing the CPU",
+                      "Used for managing QSFP+ ports (1-10)", "Used for managing QSFP+ ports (11-21)",
+                      "Used for misc status and control", "Used for managing QSFP+ ports (22-32)",
+                      "Basic Input/Output System"]
 
 
 class Component(ComponentBase):
@@ -40,23 +39,8 @@ class Component(ComponentBase):
     def __init__(self, component_index):
         ComponentBase.__init__(self)
         self.index = component_index
+        self._api_helper = APIHelper()
         self.name = self.get_name()
-
-    def __run_command(self, command):
-        # Run bash command and print output to stdout
-        try:
-            process = subprocess.Popen(
-                shlex.split(command), stdout=subprocess.PIPE)
-            while True:
-                output = process.stdout.readline()
-                if output == '' and process.poll() is not None:
-                    break
-            rc = process.poll()
-            if rc != 0:
-                return False
-        except:
-            return False
-        return True
 
     def __get_bios_version(self):
         # Retrieves the BIOS firmware version
@@ -67,23 +51,13 @@ class Component(ComponentBase):
         except Exception as e:
             return None
 
-    def get_register_value(self, register):
-        # Retrieves the cpld register value
-        cmd = "echo {1} > {0}; cat {0}".format(GETREG_PATH, register)
-        p = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        raw_data, err = p.communicate()
-        if err is not '':
-            return None
-        return raw_data.strip()
-
     def __get_cpld_version(self):
         # Retrieves the CPLD firmware version
         cpld_version = dict()
         for cpld_name in CPLD_ADDR_MAPPING:
             try:
                 cpld_addr = CPLD_ADDR_MAPPING[cpld_name]
-                cpld_version_raw = self.get_register_value(cpld_addr)
+                cpld_version_raw = self._api_helper.get_cpld_reg_value(GETREG_PATH, cpld_addr)
                 cpld_version_str = "{}.{}".format(int(cpld_version_raw[2], 16), int(
                     cpld_version_raw[3], 16)) if cpld_version_raw is not None else 'None'
                 cpld_version[cpld_name] = cpld_version_str
@@ -123,6 +97,29 @@ class Component(ComponentBase):
 
         return fw_version
 
+    def get_available_firmware_version(self, image_path):
+        """
+        Retrieves the available firmware version of the component
+        Note: the firmware version will be read from image
+        Args:
+            image_path: A string, path to firmware image
+        Returns:
+            A string containing the available firmware version of the component
+        """
+        return "N/A"
+
+    def get_firmware_update_notification(self, image_path):
+        """
+        Retrieves a notification on what should be done in order to complete
+        the component firmware update
+        Args:
+            image_path: A string, path to firmware image
+        Returns:
+            A string containing the component firmware update notification if required.
+            By default 'None' value will be used, which indicates that no actions are required
+        """
+        return "None"
+
     def install_firmware(self, image_path):
         """
         Install firmware to module
@@ -140,8 +137,80 @@ class Component(ComponentBase):
             ext = ".vme" if ext == "" else ext
             new_image_path = os.path.join("/tmp", (root.lower() + ext))
             shutil.copy(image_path, new_image_path)
-            install_command = "ispvm %s" % new_image_path
-        elif self.name == "BIOS":
-            install_command = "afulnx_64 %s /p /b /n /x /r" % image_path
+            install_command = ["ispvm", str(new_image_path)]
+        # elif self.name == "BIOS":
+        #     install_command = "afulnx_64 %s /p /b /n /x /r" % image_path
 
-        return self.__run_command(install_command)
+        return self._api_helper.run_command(install_command)
+
+
+    def update_firmware(self, image_path):
+        """
+        Updates firmware of the component
+        This API performs firmware update: it assumes firmware installation and loading in a single call.
+        In case platform component requires some extra steps (apart from calling Low Level Utility)
+        to load the installed firmware (e.g, reboot, power cycle, etc.) - this will be done automatically by API
+        Args:
+            image_path: A string, path to firmware image
+        Raises:
+            RuntimeError: update failed
+        """
+        return False
+
+
+    ##############################################################
+    ###################### Device methods ########################
+    ##############################################################
+
+
+    def get_presence(self):
+        """
+        Retrieves the presence of the FAN
+        Returns:
+            bool: True if FAN is present, False if not
+        """
+        return True
+
+    def get_model(self):
+        """
+        Retrieves the model number (or part number) of the device
+        Returns:
+            string: Model/part number of device
+        """
+        return 'N/A'
+
+    def get_serial(self):
+        """
+        Retrieves the serial number of the device
+        Returns:
+            string: Serial number of device
+        """
+        return 'N/A'
+
+    def get_status(self):
+        """
+        Retrieves the operational status of the device
+        Returns:
+            A boolean value, True if device is operating properly, False if not
+        """
+        return True
+
+    def get_position_in_parent(self):
+        """
+        Retrieves 1-based relative physical position in parent device.
+        If the agent cannot determine the parent-relative position
+        for some reason, or if the associated value of
+        entPhysicalContainedIn is'0', then the value '-1' is returned
+        Returns:
+            integer: The 1-based relative physical position in parent device
+            or -1 if cannot determine the position
+        """
+        return -1
+
+    def is_replaceable(self):
+        """
+        Indicate whether this device is replaceable.
+        Returns:
+            bool: True if it is replaceable.
+        """
+        return False

@@ -1,9 +1,10 @@
-{% if CONFIGURED_ARCH == "armhf" %}
-FROM multiarch/debian-debootstrap:armhf-jessie
-{% elif CONFIGURED_ARCH == "arm64" %}
-FROM multiarch/debian-debootstrap:arm64-jessie
+{% set prefix = DEFAULT_CONTAINER_REGISTRY %}
+{% if CONFIGURED_ARCH == "armhf" and MULTIARCH_QEMU_ENVIRON == "y" %}
+FROM {{ prefix }}multiarch/debian-debootstrap:armhf-jessie
+{% elif CONFIGURED_ARCH == "arm64" and MULTIARCH_QEMU_ENVIRON == "y" %}
+FROM {{ prefix }}multiarch/debian-debootstrap:arm64-jessie
 {% else %}
-FROM debian:jessie
+FROM {{ prefix }}{{DOCKER_BASE_ARCH}}/debian:jessie
 {% endif %}
 
 ## Remove retired jessie-updates repo
@@ -32,11 +33,12 @@ COPY ["dpkg_01_drop", "/etc/dpkg/dpkg.cfg.d/01_drop"]
 COPY ["sources.list.armhf", "/etc/apt/sources.list"]
 {% elif CONFIGURED_ARCH == "arm64" %}
 COPY ["sources.list.arm64", "/etc/apt/sources.list"]
-COPY ["aptconf_archive_expired_release", "/etc/apt/apt.conf.d"]
+COPY ["no-check-valid-until", "/etc/apt/apt.conf.d"]
 {% else %}
 COPY ["sources.list", "/etc/apt/sources.list"]
 {% endif %}
 COPY ["no_install_recommend_suggest", "/etc/apt/apt.conf.d"]
+COPY ["apt-retries-count", "/etc/apt/apt.conf.d"]
 RUN apt-get update
 
 # Pre-install fundamental packages
@@ -44,6 +46,7 @@ RUN apt-get -y install \
     vim-tiny           \
     perl               \
     python             \
+    python-pip         \
     rsyslog            \
     less
 
@@ -51,10 +54,18 @@ COPY ["etc/rsyslog.conf", "/etc/rsyslog.conf"]
 COPY ["etc/rsyslog.d/*", "/etc/rsyslog.d/"]
 COPY ["root/.vimrc", "/root/.vimrc"]
 
-# Install dependencies of supervisor
-RUN apt-get -y install python-pkg-resources python-meld3
+RUN pip install --upgrade 'pip<21'
+RUN apt-get purge -y python-pip
 
-RUN mkdir -p /etc/supervisor
+# Some Python packages require setuptools (or pkg_resources, which is supplied by setuptools)
+# and some require wheel
+RUN pip install setuptools==40.8.0
+RUN pip install wheel
+
+# Install supervisor
+RUN pip install supervisor>=3.4.0
+
+RUN mkdir -p /etc/supervisor/conf.d
 RUN mkdir -p /var/log/supervisor
 
 COPY ["etc/supervisor/supervisord.conf", "/etc/supervisor/"]

@@ -26,24 +26,24 @@ class Fan(FanBase):
     HWMON_NODE = os.listdir(HWMON_DIR)[0]
     MAILBOX_DIR = HWMON_DIR + HWMON_NODE
 
-    def __init__(self, fantray_index=1, fan_index=1, psu_fan=False):
+    def __init__(self, fantray_index=1, psu_index=1, psu_fan=False, dependency=None):
+        FanBase.__init__(self)
         self.is_psu_fan = psu_fan
         if not self.is_psu_fan:
-            # API index is starting from 0, DellEMC platform index is starting
-            # from 1
-            self.fantrayindex = fantray_index + 1
-            self.fanindex = fan_index + 1
+            self.fantrayindex = fantray_index
+            self.dependency = dependency
+            self.fan_status_reg = "fan{}_alarm".format(
+                        2 * self.fantrayindex - 1)
             self.get_fan_speed_reg = "fan{}_input".format(
                         2 * self.fantrayindex - 1)
             self.get_fan_dir_reg = "fan{}_airflow".format(
                         2 * self.fantrayindex - 1)
-            self.fan_serialno_reg = "fan{}_serialno".format(
-                        2 * self.fantrayindex - 1)
             self.max_fan_speed = MAX_S6100_FAN_SPEED
         else:
-            # PSU Fan index starts from 11
-            self.fanindex = fan_index + 10
-            self.get_fan_speed_reg = "fan{}_input".format(self.fanindex)
+            self.psuindex = psu_index
+            self.fan_presence_reg = "fan{}_fault".format(self.psuindex + 10)
+            self.get_fan_speed_reg = "fan{}_input".format(self.psuindex + 10)
+            self.get_fan_dir_reg = "fan{}_airflow".format(self.psuindex + 10)
             self.max_fan_speed = MAX_S6100_PSU_FAN_SPEED
 
     def _get_pmc_register(self, reg_name):
@@ -71,10 +71,9 @@ class Fan(FanBase):
             string: The name of the device
         """
         if not self.is_psu_fan:
-            return "FanTray{}-Fan{}".format(
-                                self.fantrayindex, self.fanindex - 1)
+            return "FanTray{}-Fan1".format(self.fantrayindex)
         else:
-            return "PSU{} Fan".format(self.fanindex - 10)
+            return "PSU{} Fan".format(self.psuindex)
 
     def get_model(self):
         """
@@ -82,18 +81,7 @@ class Fan(FanBase):
         Returns:
             string: Part number of FAN
         """
-        # For Serial number "US-01234D-54321-25A-0123-A00", the part
-        # number is "01234D"
-        fan_serialno = self._get_pmc_register(self.fan_serialno_reg)
-        if (fan_serialno != 'ERR') and self.get_presence():
-            if (len(fan_serialno.split('-')) > 1):
-                fan_partno = fan_serialno.split('-')[1]
-            else:
-                fan_partno = 'NA'
-        else:
-            fan_partno = 'NA'
-
-        return fan_partno
+        return 'NA'
 
     def get_serial(self):
         """
@@ -101,12 +89,7 @@ class Fan(FanBase):
         Returns:
             string: Serial number of FAN
         """
-        # Sample Serial number format "US-01234D-54321-25A-0123-A00"
-        fan_serialno = self._get_pmc_register(self.fan_serialno_reg)
-        if (fan_serialno == 'ERR') or not self.get_presence():
-            fan_serialno = 'NA'
-
-        return fan_serialno
+        return 'NA'
 
     def get_presence(self):
         """
@@ -114,14 +97,17 @@ class Fan(FanBase):
         Returns:
             bool: True if fan is present, False if not
         """
-        status = False
-        fantray_presence = self._get_pmc_register(self.get_fan_speed_reg)
-        if (fantray_presence != 'ERR'):
-            fantray_presence = int(fantray_presence, 10)
-        if (fantray_presence > 0):
-            status = True
+        if not self.is_psu_fan:
+            return self.dependency.get_presence()
 
-        return status
+        presence = False
+        fan_presence = self._get_pmc_register(self.fan_presence_reg)
+        if (fan_presence != 'ERR'):
+            fan_presence = int(fan_presence, 10)
+            if (~fan_presence & 0b1):
+                presence = True
+
+        return presence
 
     def get_status(self):
         """
@@ -130,13 +116,37 @@ class Fan(FanBase):
             bool: True if FAN is operating properly, False if not
         """
         status = False
-        fantray_status = self._get_pmc_register(self.get_fan_speed_reg)
-        if (fantray_status != 'ERR'):
-            fantray_status = int(fantray_status, 10)
-            if (fantray_status > 5000):
-                status = True
+        if self.is_psu_fan:
+            fantray_status = self._get_pmc_register(self.get_fan_speed_reg)
+            if (fantray_status != 'ERR'):
+                fantray_status = int(fantray_status, 10)
+                if (fantray_status > 1000):
+                    status = True
+        else:
+            fantray_status = self._get_pmc_register(self.fan_status_reg)
+            if (fantray_status != 'ERR'):
+                fantray_status = int(fantray_status, 10)
+                if (~fantray_status & 0b1):
+                    status = True
 
         return status
+
+    def get_position_in_parent(self):
+        """
+        Retrieves 1-based relative physical position in parent device.
+        Returns:
+            integer: The 1-based relative physical position in parent
+            device or -1 if cannot determine the position
+        """
+        return 1
+
+    def is_replaceable(self):
+        """
+        Indicate whether Fan is replaceable.
+        Returns:
+            bool: True if it is replaceable.
+        """
+        return False
 
     def get_direction(self):
         """
@@ -144,13 +154,18 @@ class Fan(FanBase):
         Returns:
             A string, either FAN_DIRECTION_INTAKE or FAN_DIRECTION_EXHAUST
             depending on fan direction
+
+        Notes:
+            In DellEMC platforms,
+            - Forward/Exhaust : Air flows from Port side to Fan side.
+            - Reverse/Intake  : Air flows from Fan side to Port side.
         """
-        direction = ['FAN_DIRECTION_INTAKE', 'FAN_DIRECTION_EXHAUST']
+        direction = [self.FAN_DIRECTION_INTAKE, self.FAN_DIRECTION_EXHAUST]
         fan_direction = self._get_pmc_register(self.get_fan_dir_reg)
         if (fan_direction != 'ERR') and self.get_presence():
             fan_direction = int(fan_direction, 10)
         else:
-            return 'N/A'
+            return self.FAN_DIRECTION_NOT_APPLICABLE
         return direction[fan_direction]
 
     def get_speed(self):
@@ -162,7 +177,7 @@ class Fan(FanBase):
         fan_speed = self._get_pmc_register(self.get_fan_speed_reg)
         if (fan_speed != 'ERR') and self.get_presence():
             speed_in_rpm = int(fan_speed, 10)
-            speed = (100 * speed_in_rpm)/self.max_fan_speed
+            speed = (100 * speed_in_rpm)//self.max_fan_speed
         else:
             speed = 0
 
@@ -192,7 +207,6 @@ class Fan(FanBase):
         Returns:
             bool: True if set success, False if fail.
         """
-
         # Fan speeds are controlled by Smart-fussion FPGA.
         return False
 
@@ -205,9 +219,9 @@ class Fan(FanBase):
         Returns:
             bool: True if set success, False if fail.
         """
-        # Leds are controlled by Smart-fussion FPGA.
-        status = False
-        return status
+        # No LED available for FanTray and PSU Fan
+        # Return True to avoid thermalctld alarm.
+        return True
 
     def get_status_led(self):
         """
@@ -216,10 +230,8 @@ class Fan(FanBase):
         Returns:
             A string, one of the predefined STATUS_LED_COLOR_* strings.
         """
-        if self.get_status():
-            return self.STATUS_LED_COLOR_GREEN
-        else:
-            return self.STATUS_LED_COLOR_OFF
+        # No LED available for FanTray and PSU Fan
+        return None
 
     def get_target_speed(self):
         """
@@ -228,6 +240,6 @@ class Fan(FanBase):
             An integer, the percentage of full fan speed, in the range 0 (off)
                  to 100 (full speed)
         """
-        return  0
-
-
+        # Fan speeds are controlled by Smart-fussion FPGA.
+        # Return current speed to avoid false thermalctld alarm.
+        return self.get_speed()

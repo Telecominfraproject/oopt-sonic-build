@@ -3,13 +3,13 @@
 # provides the PSUs status which are available in the platform
 #
 
-import os.path
 import subprocess
 
 try:
     from sonic_psu.psu_base import PsuBase
 except ImportError as e:
-    raise ImportError (str(e) + "- required module not found")
+    raise ImportError(str(e) + "- required module not found")
+
 
 class PsuUtil(PsuBase):
     """Platform-specific PSUutil class"""
@@ -37,8 +37,9 @@ class PsuUtil(PsuBase):
             return False
         status = 0
         try:
-            p = os.popen("ipmitool raw 0x38 0x2 3 0x6a 0x3 1")
-            content = p.readline().rstrip()
+            cmd = ["ipmitool", "raw", "0x38", "0x2", "3", "0x6a", "0x3", "1"]
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+            content = p.stdout.readline().rstrip()
             reg_value = int(content, 16)
             if index == 1:
                 mask = (1 << 6)
@@ -51,7 +52,6 @@ class PsuUtil(PsuBase):
         except IOError:
             return False
         return status == 1
-
 
     def get_psu_presence(self, index):
         """
@@ -66,20 +66,20 @@ class PsuUtil(PsuBase):
 
         status = 0
         try:
-            p = os.popen("ipmitool raw 0x38 0x2 3 0x6a 0x3 1")
-            content = p.readline().rstrip()
+            cmd = ["ipmitool", "raw", "0x38", "0x2", "3", "0x6a", "0x3", "1"]
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+            content = p.stdout.readline().rstrip()
             reg_value = int(content, 16)
             if index == 1:
                 mask = (1 << 7)
                 if reg_value & mask == 0x80:
-                   return False
+                    return False
             else:
                 mask = (1 << 3)
                 if reg_value & mask == 0x08:
-                   return False
+                    return False
             status = 1
             p.close()
         except IOError:
             return False
         return status == 1
-

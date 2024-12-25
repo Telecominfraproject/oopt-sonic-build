@@ -4,4 +4,5 @@
 depmod -a 
 systemctl enable platform-modules-s6000.service
 systemctl start platform-modules-s6000.service
+
 #DEBHELPER#

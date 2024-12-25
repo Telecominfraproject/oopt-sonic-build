@@ -1,6 +1,4 @@
 # Subdirectories
-mlnx-sai/*
-!mlnx-sai/Makefile
 hw-management/*
 !hw-management/Makefile
 !hw-management/*.patch
@@ -8,6 +6,7 @@ mft/*
 !mft/Makefile
 sdk-src/*/*
 !sdk-src/*/Makefile
+!sdk-src/sx-kernel/Switch-SDK-drivers/
 !sdk-src/*/*.patch
 */build
 */deb_dist

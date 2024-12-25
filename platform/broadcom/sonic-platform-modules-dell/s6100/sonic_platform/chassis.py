@@ -10,32 +10,25 @@
 
 try:
     import os
-    import sys
-    import click
-    import subprocess
-    import glob
-    import sonic_device_util
-    from sonic_platform_base.platform_base import PlatformBase
+    import re
+    import time
     from sonic_platform_base.chassis_base import ChassisBase
-    from sonic_platform.sfp import Sfp
-    from sonic_platform.psu import Psu
-    from sonic_platform.fan import Fan
+    from sonic_platform.component import Component
+    from sonic_platform.eeprom import Eeprom
+    from sonic_platform.fan_drawer import FanDrawer
     from sonic_platform.module import Module
+    from sonic_platform.psu import Psu
     from sonic_platform.thermal import Thermal
-    from eeprom import Eeprom
+    from sonic_platform.watchdog import Watchdog, WatchdogTCO
+    from sonic_platform.sfp import Sfp
 except ImportError as e:
     raise ImportError(str(e) + "- required module not found")
 
 MAX_S6100_MODULE = 4
-MAX_S6100_FAN = 4
+MAX_S6100_FANTRAY = 4
 MAX_S6100_PSU = 2
 MAX_S6100_THERMAL = 10
-
-BIOS_QUERY_VERSION_COMMAND = "dmidecode -s system-version"
-#components definitions
-COMPONENT_BIOS = "BIOS"
-SWITCH_CPLD = "CPLD"
-SMF_FPGA = "FPGA1"
+MAX_S6100_COMPONENT = 5
 
 
 class Chassis(ChassisBase):
@@ -46,12 +39,15 @@ class Chassis(ChassisBase):
     HWMON_DIR = "/sys/devices/platform/SMF.512/hwmon/"
     HWMON_NODE = os.listdir(HWMON_DIR)[0]
     MAILBOX_DIR = HWMON_DIR + HWMON_NODE
+    POLL_INTERVAL = 1 # Poll interval in seconds
 
     reset_reason_dict = {}
     reset_reason_dict[11] = ChassisBase.REBOOT_CAUSE_POWER_LOSS
     reset_reason_dict[33] = ChassisBase.REBOOT_CAUSE_WATCHDOG
     reset_reason_dict[44] = ChassisBase.REBOOT_CAUSE_NON_HARDWARE
     reset_reason_dict[55] = ChassisBase.REBOOT_CAUSE_NON_HARDWARE
+    reset_reason_dict[66] = ChassisBase.REBOOT_CAUSE_HARDWARE_OTHER
+    reset_reason_dict[77] = ChassisBase.REBOOT_CAUSE_HARDWARE_OTHER
 
     power_reason_dict = {}
     power_reason_dict[11] = ChassisBase.REBOOT_CAUSE_POWER_LOSS
@@ -59,18 +55,43 @@ class Chassis(ChassisBase):
     power_reason_dict[33] = ChassisBase.REBOOT_CAUSE_THERMAL_OVERLOAD_ASIC
     power_reason_dict[44] = ChassisBase.REBOOT_CAUSE_INSUFFICIENT_FAN_SPEED
 
+    status_led_reg_to_color = {
+        0x00: 'green', 0x01: 'blinking green', 0x02: 'amber',
+        0x04: 'amber', 0x08: 'blinking amber', 0x10: 'blinking amber'
+    }
+
+    color_to_status_led_reg = {
+        'green': 0x00, 'blinking green': 0x01,
+        'amber': 0x02, 'blinking amber': 0x08
+    }
+
+    _global_port_pres_dict = {}
+
     def __init__(self):
 
         ChassisBase.__init__(self)
+        self.status_led_reg = "sys_status_led"
+        self.supported_led_color = ['green', 'blinking green', 'amber', 'blinking amber']
         # Initialize EEPROM
-        self.sys_eeprom = Eeprom()
+        self._eeprom = Eeprom()
         for i in range(MAX_S6100_MODULE):
             module = Module(i)
             self._module_list.append(module)
+            self._sfp_list.extend(module._sfp_list)
 
-        for i in range(MAX_S6100_FAN):
-            fan = Fan(i)
-            self._fan_list.append(fan)
+        #SFP ports
+        sfp_port = 11
+        for index in range(64,66):
+             eeprom_path = "/sys/bus/i2c/devices/i2c-{0}/{0}-0050/eeprom".format(sfp_port)
+             sfp_control = ""
+             sfp_node = Sfp(index, 'SFP', eeprom_path, sfp_control, index)
+             self._sfp_list.append(sfp_node)
+             sfp_port = sfp_port + 1
+
+        for i in range(MAX_S6100_FANTRAY):
+            fandrawer = FanDrawer(i)
+            self._fan_drawer_list.append(fandrawer)
+            self._fan_list.extend(fandrawer._fan_list)
 
         for i in range(MAX_S6100_PSU):
             psu = Psu(i)
@@ -80,15 +101,34 @@ class Chassis(ChassisBase):
             thermal = Thermal(i)
             self._thermal_list.append(thermal)
 
-        # Initialize component list
-        self._component_name_list.append(COMPONENT_BIOS)
-        self._component_name_list.append(SWITCH_CPLD)
-        self._component_name_list.append(SMF_FPGA)
+        for i in range(MAX_S6100_COMPONENT):
+            component = Component(i)
+            self._component_list.append(component)
+
+        for i in self._sfp_list:
+            presence = i.get_presence()
+            if presence:
+                self._global_port_pres_dict[i.index] = '1'
+            else:
+                self._global_port_pres_dict[i.index] = '0'
+
+        bios_ver = self.get_component(0).get_firmware_version()
+        bios_minor_ver = bios_ver.split("-")[-1]
+        if bios_minor_ver.isdigit() and (int(bios_minor_ver) >= 9):
+            self._watchdog = WatchdogTCO()
+        else:
+            self._watchdog = Watchdog()
+
+        self._transceiver_presence = self._get_transceiver_presence()
 
     def _get_reboot_reason_smf_register(self):
-        # Returns 0xAA on software reload
-        # Returns 0xFF on power-cycle
-        # Returns 0x01 on first-boot
+        # In S6100, mb_poweron_reason register will
+        # Returns 0xaa or 0xcc on software reload
+        # Returns 0x88 on cold-reboot happened during software reload
+        # Returns 0xff or 0xbb on power-cycle
+        # Returns 0xdd on Watchdog
+        # Returns 0xee on Thermal Shutdown
+        # Returns 0x99 on Unknown reset
         smf_mb_reg_reason = self._get_pmc_register('mb_poweron_reason')
         return int(smf_mb_reg_reason, 16)
 
@@ -111,18 +151,40 @@ class Chassis(ChassisBase):
         rv = rv.lstrip(" ")
         return rv
 
-    # Run bash command and print output to stdout
-    def run_command(self, command):
-        click.echo(click.style("Command: ", fg='cyan') +
-                   click.style(command, fg='green'))
+    def _set_pmc_register(self, reg_name, value):
+        # On successful write, returns the length of value written on
+        # reg_name and on failure returns 'ERR'
+        rv = 'ERR'
+        mb_reg_file = self.MAILBOX_DIR + '/' + reg_name
 
-        proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
-        (out, err) = proc.communicate()
+        if (not os.path.isfile(mb_reg_file)):
+            return rv
 
-        click.echo(out)
+        try:
+            with open(mb_reg_file, 'w') as fd:
+                rv = fd.write(str(value))
+        except IOError:
+            rv = 'ERR'
 
-        if proc.returncode != 0:
-            sys.exit(proc.returncode)
+        return rv
+
+    def _get_register(self, reg_file):
+        # On successful read, returns the value read from given
+        # reg_name and on failure returns 'ERR'
+        rv = 'ERR'
+
+        if (not os.path.isfile(reg_file)):
+            return rv
+
+        try:
+            with open(reg_file, 'r') as fd:
+                rv = fd.read()
+        except Exception as error:
+            rv = 'ERR'
+
+        rv = rv.rstrip('\r\n')
+        rv = rv.lstrip(" ")
+        return rv
 
     def get_name(self):
         """
@@ -130,7 +192,7 @@ class Chassis(ChassisBase):
         Returns:
             string: The name of the chassis
         """
-        return self.sys_eeprom.modelstr()
+        return self._eeprom.modelstr()
 
     def get_presence(self):
         """
@@ -146,7 +208,7 @@ class Chassis(ChassisBase):
         Returns:
             string: Model/part number of chassis
         """
-        return self.sys_eeprom.part_number_str()
+        return self._eeprom.part_number_str()
 
     def get_serial(self):
         """
@@ -154,7 +216,7 @@ class Chassis(ChassisBase):
         Returns:
             string: Serial number of chassis
         """
-        return self.sys_eeprom.serial_str()
+        return self._eeprom.serial_number_str()
 
     def get_status(self):
         """
@@ -165,6 +227,23 @@ class Chassis(ChassisBase):
         """
         return True
 
+    def get_position_in_parent(self):
+        """
+        Retrieves 1-based relative physical position in parent device.
+        Returns:
+            integer: The 1-based relative physical position in parent
+            device or -1 if cannot determine the position
+        """
+        return -1
+
+    def is_replaceable(self):
+        """
+        Indicate whether Chassis is replaceable.
+        Returns:
+            bool: True if it is replaceable.
+        """
+        return False
+
     def get_base_mac(self):
         """
         Retrieves the base MAC address for the chassis
@@ -173,17 +252,16 @@ class Chassis(ChassisBase):
             A string containing the MAC address in the format
             'XX:XX:XX:XX:XX:XX'
         """
-        return self.sys_eeprom.base_mac_addr()
+        return self._eeprom.base_mac_addr()
 
-    def get_serial_number(self):
+    def get_revision(self):
         """
-        Retrieves the hardware serial number for the chassis
+        Retrieves the hardware revision of the device
 
         Returns:
-            A string containing the hardware serial number for this
-            chassis.
+            string: Revision value of device
         """
-        return self.sys_eeprom.serial_number_str()
+        return self._eeprom.revision_str()
 
     def get_system_eeprom_info(self):
         """
@@ -193,7 +271,20 @@ class Chassis(ChassisBase):
             OCP ONIE TlvInfo EEPROM format and values are their corresponding
             values.
         """
-        return self.sys_eeprom.system_eeprom_info()
+        return self._eeprom.system_eeprom_info()
+
+    def get_module_index(self, module_name):
+        """
+        Retrieves module index from the module name
+
+        Args:
+            module_name: A string, prefixed by SUPERVISOR, LINE-CARD or FABRIC-CARD
+            Ex. SUPERVISOR0, LINE-CARD1, FABRIC-CARD5
+        Returns:
+            An integer, the index of the ModuleBase object in the module_list
+        """
+        module_index = re.match(r'IOM([1-4])', module_name).group(1)
+        return int(module_index) - 1
 
     def get_reboot_cause(self):
         """
@@ -210,171 +301,161 @@ class Chassis(ChassisBase):
         power_reason = int(self._get_pmc_register('smf_poweron_reason'))
         smf_mb_reg_reason = self._get_reboot_reason_smf_register()
 
-        if ((smf_mb_reg_reason == 0x01) and (power_reason == 0x11)):
+        if ((smf_mb_reg_reason == 0xbb) or (smf_mb_reg_reason == 0xff)):
+            return (ChassisBase.REBOOT_CAUSE_POWER_LOSS, None)
+        elif ((smf_mb_reg_reason == 0xaa) or (smf_mb_reg_reason == 0xcc)):
             return (ChassisBase.REBOOT_CAUSE_NON_HARDWARE, None)
-
-        # Reset_Reason = 11 ==> PowerLoss
-        # So return the reboot reason from Last Power_Reason Dictionary
-        # If Reset_Reason is not 11 return from Reset_Reason dictionary
-        # Also check if power_reason, reset_reason are valid values by
-        # checking key presence in dictionary else return
-        # REBOOT_CAUSE_HARDWARE_OTHER as the Power_Reason and Reset_Reason
-        # registers returned invalid data
-
-        # In S6100, if Reset_Reason is not 11 and smf_mb_reg_reason
-        # is ff or bb, then it is PowerLoss
-        if (reset_reason == 11):
-            if (power_reason in self.power_reason_dict):
-                return (self.power_reason_dict[power_reason], None)
+        elif (smf_mb_reg_reason == 0x88):
+            return (ChassisBase.REBOOT_CAUSE_HARDWARE_OTHER, "CPU Reset")
+        elif (smf_mb_reg_reason == 0xdd):
+            return (ChassisBase.REBOOT_CAUSE_WATCHDOG, None)
+        elif (smf_mb_reg_reason == 0xee):
+            return (self.power_reason_dict[power_reason], None)
+        elif (reset_reason == 66):
+            return (ChassisBase.REBOOT_CAUSE_HARDWARE_OTHER,
+                    "Emulated Cold Reset")
+        elif (reset_reason == 77):
+            return (ChassisBase.REBOOT_CAUSE_HARDWARE_OTHER,
+                    "Emulated Warm Reset")
         else:
-            if ((smf_mb_reg_reason == 0xbb) or (smf_mb_reg_reason == 0xff)):
-                return (ChassisBase.REBOOT_CAUSE_POWER_LOSS, None)
-
-            if (reset_reason in self.reset_reason_dict):
-                return (self.reset_reason_dict[reset_reason], None)
+            return (ChassisBase.REBOOT_CAUSE_NON_HARDWARE, None)
 
         return (ChassisBase.REBOOT_CAUSE_HARDWARE_OTHER, "Invalid Reason")
 
-    def _get_command_result(self, cmdline):
-        try:
-            proc = subprocess.Popen(cmdline, stdout=subprocess.PIPE,
-                                    shell=True, stderr=subprocess.STDOUT)
-            stdout = proc.communicate()[0]
-            proc.wait()
-            result = stdout.rstrip('\n')
-        except OSError:
-            result = ''
+    def _get_transceiver_presence(self):
 
-        return result
+        cpld2_modprs = self._get_register(
+                    "/sys/class/i2c-adapter/i2c-14/14-003e/qsfp_modprs")
+        cpld3_modprs = self._get_register(
+                    "/sys/class/i2c-adapter/i2c-15/15-003e/qsfp_modprs")
+        cpld4_modprs = self._get_register(
+                    "/sys/class/i2c-adapter/i2c-16/16-003e/qsfp_modprs")
+        cpld5_modprs = self._get_register(
+                    "/sys/class/i2c-adapter/i2c-17/17-003e/qsfp_modprs")
 
-    def _get_cpld_version(self):
-        io_resource = "/dev/port"
-        CPLD1_VERSION_ADDR = 0x100
+        # If IOM is not present, register read will fail.
+        # Handle the scenario gracefully
+        if (cpld2_modprs == 'read error') or (cpld2_modprs == 'ERR'):
+            cpld2_modprs = '0x0'
+        if (cpld3_modprs == 'read error') or (cpld3_modprs == 'ERR'):
+            cpld3_modprs = '0x0'
+        if (cpld4_modprs == 'read error') or (cpld4_modprs == 'ERR'):
+            cpld4_modprs = '0x0'
+        if (cpld5_modprs == 'read error') or (cpld5_modprs == 'ERR'):
+            cpld5_modprs = '0x0'
 
-        fd = os.open(io_resource, os.O_RDONLY)
-        if (fd < 0):
-            return 'NA'
-        if (os.lseek(fd, CPLD1_VERSION_ADDR, os.SEEK_SET)
-            != CPLD1_VERSION_ADDR):
-            return 'NA'
+        # Make it contiguous
+        transceiver_presence = (int(cpld2_modprs, 16) & 0xffff) |\
+                               ((int(cpld4_modprs, 16) & 0xffff) << 16) |\
+                               ((int(cpld3_modprs, 16) & 0xffff) << 32) |\
+                               ((int(cpld5_modprs, 16) & 0xffff) << 48)
 
-        buf = os.read(fd, 1)
-        cpld_version = ord(buf)
-        os.close(fd)
+        return transceiver_presence
 
-        return "%d.%d" % (((cpld_version & 0xF0) >> 4), cpld_version & 0xF)
-
-    def _get_fpga_version(self):
-        fpga_ver = float(self._get_pmc_register('smf_firmware_ver'))
-        return fpga_ver
-
-    def get_firmware_version(self, component_name):
+    def get_change_event(self, timeout=0):
         """
-        Retrieves platform-specific hardware/firmware versions for
-        chassis componenets such as BIOS, CPLD, FPGA, etc.
+        Returns a nested dictionary containing all devices which have
+        experienced a change at chassis level
+
         Args:
-            component_name: A string, the component name.
+            timeout: Timeout in milliseconds (optional). If timeout == 0,
+                this method will block until a change is detected.
+
         Returns:
-            A string containing platform-specific component versions
+            (bool, dict):
+                - True if call successful, False if not;
+                - A nested dictionary where key is a device type,
+                  value is a dictionary with key:value pairs in the
+                  format of {'device_id':'device_event'},
+                  where device_id is the device ID for this device and
+                        device_event,
+                             status='1' represents device inserted,
+                             status='0' represents device removed.
+                  Ex. {'fan':{'0':'0', '2':'1'}, 'sfp':{'11':'0'}}
+                      indicates that fan 0 has been removed, fan 2
+                      has been inserted and sfp 11 has been removed.
         """
-        if component_name in self._component_name_list :
-            if component_name == COMPONENT_BIOS:
-                return self._get_command_result(BIOS_QUERY_VERSION_COMMAND)
-            elif component_name == SWITCH_CPLD:
-                return self._get_cpld_version()
-            elif component_name == SMF_FPGA:
-                return self._get_fpga_version()
+        port_dict = {}
+        ret_dict = {'sfp': port_dict}
+        forever = False
 
-        return None
-
-    def install_component_firmware(self, component_name, image_path):
-
-        bios_image = None
-        bios_version = "3.25.0."
-        bios_file_name = "S6100*BIOS*"
-        flashrom = "/usr/local/bin/flashrom"
-        PLATFORM_ROOT_PATH = '/usr/share/sonic/device'
-        machine_info = sonic_device_util.get_machine_info()
-        platform = sonic_device_util.get_platform_info(machine_info)
-        platform_path = "/".join([PLATFORM_ROOT_PATH, platform, "bin"])
-
-        warning = """
-        ********************************************************************
-        * Warning - Upgrading BIOS is inherently risky and should only be  *
-        * attempted when necessary.  A failure at this upgrade may cause   *
-        * a board RMA.  Proceed with caution !                             *
-        ********************************************************************
-        """
-
-        if component_name in self._component_name_list:
-            if component_name == COMPONENT_BIOS:  # BIOS
-
-                # current BIOS version
-                current_bios_version = self.get_firmware_version("BIOS")
-
-                # Construct BIOS image path
-                if image_path is not None:
-                    image_path = image_path + platform_path
-                    for name in glob.glob(
-                                    os.path.join(image_path, bios_file_name)):
-                        bios_image = image_path = name
-
-                if not bios_image:
-                    print "BIOS image file not found:", image_path
-                    return False
-
-                # Extract BIOS image version
-                bios_image = os.path.basename(bios_image)
-                bios_image = bios_image.strip('S6100-BIOS-')
-                bios_image_version = bios_image.strip('.bin')
-
-                if bios_image_version.startswith(bios_version):
-                    bios_image_minor = bios_image_version.replace(
-                                                bios_image_version[:7], '')
-                    if bios_image_minor.startswith("2"):
-                        bios_image_minor = bios_image_minor.split("-")[1]
-
-                if current_bios_version.startswith(bios_version):
-                    current_bios_minor = current_bios_version.replace(
-                                                current_bios_version[:7], '')
-                    if current_bios_minor.startswith("2"):
-                        current_bios_minor = current_bios_minor.split("-")[1]
-
-                # BIOS version check
-                if bios_image_minor > current_bios_minor:
-
-                    print warning
-                    prompt_text = "New BIOS image " + bios_image_version + \
-                        " available to install, continue?"
-                    yes = click.confirm(prompt_text)
-
-                elif current_bios_minor > bios_image_minor:
-
-                    print warning
-                    prompt_text = "Do you want to downgrade BIOS image from " \
-                        + current_bios_version + " to " + \
-                        bios_image_version + " continue?"
-
-                    yes = click.confirm(prompt_text)
-
-                else:
-                    print("BIOS is already with {} latest version".format(
-                        current_bios_version))
-                    return True
-
-                if yes:
-                    command = flashrom + " -p" + " internal" + " -w " + \
-                                         image_path
-                    self.run_command(command)
-
-            elif component_name == SWITCH_CPLD:  # CPLD
-                return False
-
-            elif component_name == SMF_FPGA:  # SMF
-                return False
+        if timeout == 0:
+            forever = True
+        elif timeout > 0:
+            timeout = timeout / float(1000) # Convert to secs
         else:
-            print "Invalid component Name:", component_name
+            return False, ret_dict # Incorrect timeout
 
+        while True:
+            if forever:
+                timer = self.POLL_INTERVAL
+            else:
+                timer = min(timeout, self.POLL_INTERVAL)
+                start_time = time.time()
+
+            time.sleep(timer)
+            cur_presence = self._get_transceiver_presence()
+
+            # Update dict only if a change has been detected
+            if cur_presence != self._transceiver_presence:
+                changed_ports = self._transceiver_presence ^ cur_presence
+                for port in range(self.get_num_sfps()):
+                    # Mask off the bit corresponding to particular port
+                    mask = 1 << port
+                    if changed_ports & mask:
+                        # qsfp_modprs 1 => optics is removed
+                        if cur_presence & mask:
+                            port_dict[port] = '0'
+                        # qsfp_modprs 0 => optics is inserted
+                        else:
+                            port_dict[port] = '1'
+
+                # Update current presence
+                self._transceiver_presence = cur_presence
+                break
+
+            if not forever:
+                elapsed_time = time.time() - start_time
+                timeout = round(timeout - elapsed_time, 3)
+                if timeout <= 0:
+                    break
+
+        return True, ret_dict
+
+    def initizalize_system_led(self):
         return True
 
+    def set_status_led(self, color):
+        """
+        Sets the state of the system LED
 
+        Args:
+            color: A string representing the color with which to set the
+                   system LED
+
+        Returns:
+            bool: True if system LED state is set successfully, False if not
+        """
+        if color not in self.supported_led_color:
+            return False
+
+        value = self.color_to_status_led_reg[color]
+        rv = self._set_pmc_register(self.status_led_reg, value)
+        if (rv != 'ERR'):
+            return True
+        else:
+            return False
+
+    def get_status_led(self):
+        """
+        Gets the state of the system LED
+
+        Returns:
+            A string, one of the valid LED color strings which could be
+            vendor specified.
+        """
+        reg_val = self._get_pmc_register(self.status_led_reg)
+        if (reg_val != 'ERR'):
+            return self.status_led_reg_to_color.get(int(reg_val, 16), None)
+        else:
+            return None

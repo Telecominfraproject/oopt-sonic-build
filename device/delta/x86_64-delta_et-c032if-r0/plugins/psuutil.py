@@ -3,20 +3,20 @@
 # provides the PSUs status which are available in the platform
 #
 
-import os.path
 import subprocess
 
 try:
     from sonic_psu.psu_base import PsuBase
 except ImportError as e:
-    raise ImportError (str(e) + "- required module not found")
+    raise ImportError(str(e) + "- required module not found")
+
 
 class PsuUtil(PsuBase):
     """Platform-specific PSUutil class"""
 
     def __init__(self):
         PsuBase.__init__(self)
-        self.psu_status = "ipmitool raw 0x38 0x1 {} 0x50"
+        self.psu_status = ["ipmitool", "raw", "0x38", "0x1", "", "0x50"]
 
     def get_num_psus(self):
         """
@@ -38,20 +38,19 @@ class PsuUtil(PsuBase):
             return False
 
         status = 0
+        cmd = ["ipmitool", "raw", "0x38", "0x2", "7", "0x32", "0x28", "1"]
         try:
-            p = os.popen("ipmitool raw 0x38 0x2 7 0x32 0x28 1")
-            content = p.readline().rstrip()
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+            content = p.stdout.readline().rstrip()
             reg_value = int(content, 16)
             mask = (1 << (8 - index))
             if reg_value & mask == 0:
-               return False
+                return False
             status = 1
             p.close()
         except IOError:
             return False
         return status == 1
-
-
 
     def get_psu_presence(self, index):
         """
@@ -64,9 +63,10 @@ class PsuUtil(PsuBase):
         if index is None:
             return False
         status = 0
+        self.psu_status[4] = str(index-1)
         try:
-            p = os.popen(self.psu_status.format(index - 1))
-            content = p.readline().rstrip()
+            p = subprocess.Popen(self.psu_status, stdout=subprocess.PIPE, universal_newlines=True)
+            content = p.stdout.readline().rstrip()
             reg_value = int(content, 16)
             if reg_value != 0:
                 return False
@@ -75,4 +75,3 @@ class PsuUtil(PsuBase):
         except IOError:
             return False
         return status == 1
-

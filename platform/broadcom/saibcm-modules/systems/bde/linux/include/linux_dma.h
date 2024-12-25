@@ -1,5 +1,12 @@
-/*
- * Copyright 2017 Broadcom
+/***********************************************************************
+ *
+ * $Id: linux_dma.h,v 1.24 Broadcom SDK $
+ * $Copyright: 2017-2024 Broadcom Inc. All rights reserved.
+ * 
+ * Permission is granted to use, copy, modify and/or distribute this
+ * software under either one of the licenses below.
+ * 
+ * License Option 1: GPL
  * 
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2, as
@@ -12,12 +19,14 @@
  * 
  * You should have received a copy of the GNU General Public License
  * version 2 (GPLv2) along with this source code.
- */
-/***********************************************************************
- *
- * $Id: linux_dma.h,v 1.24 Broadcom SDK $
- * $Copyright: (c) 2016 Broadcom Corp.
- * All Rights Reserved.$
+ * 
+ * 
+ * License Option 2: Broadcom Open Network Switch APIs (OpenNSA) license
+ * 
+ * This software is governed by the Broadcom Open Network Switch APIs license:
+ * https://www.broadcom.com/products/ethernet-connectivity/software/opennsa $
+ * 
+ * 
  *
  **********************************************************************/
 
@@ -32,13 +41,6 @@
 #define KMALLOC(size, flags)    __kmalloc(size, flags)
 #else
 #define KMALLOC(size, flags)    kmalloc(size, flags)
-#endif
-
-#if defined(CONFIG_IDT_79EB334) || defined(CONFIG_BCM4702)
-/* ioremap is broken in kernel */
-#define IOREMAP(addr, size) ((void *)KSEG1ADDR(addr))
-#else
-#define IOREMAP(addr, size) ioremap_nocache(addr, size)
 #endif
 
 #if defined (__mips__)
@@ -58,9 +60,10 @@
 #define DMA_BIT_MASK(n) (((n) == 64) ? ~0ULL : ((1ULL<<(n))-1))
 #endif
 
-extern void _dma_init(int robo_switch, int dev_index);
+extern void _dma_init(void);
+extern void _dma_per_device_init(int dev_index);
 extern int _dma_cleanup(void);
-extern void _dma_pprint(void);
+extern void _dma_pprint(struct seq_file *m);
 extern uint32_t *_salloc(int d, int size, const char *name);
 extern void _sfree(int d, void *ptr);
 extern int _sinval(int d, void *ptr, int length);
@@ -68,7 +71,12 @@ extern int _sflush(int d, void *ptr, int length);
 extern sal_paddr_t _l2p(int d, void *vaddr);
 extern void *_p2l(int d, sal_paddr_t paddr);
 extern int _dma_pool_allocated(void);
-extern int _dma_range_valid(unsigned long phys_addr, unsigned long size);
+extern int _dma_mmap(struct file *filp, struct vm_area_struct *vma);
+
+#ifdef INCLUDE_SRAM_DMA
+/* A mode to use SRAM for DMA for some systems where the CPU has no PCIe connection to the device */
+extern int use_sram_for_dma;
+#endif /* INCLUDE_SRAM_DMA */
 
 #endif /* __KERNEL__ */
 

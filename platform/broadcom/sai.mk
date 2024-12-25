@@ -1,9 +1,26 @@
-BRCM_SAI = libsaibcm_3.5.3.1-15_amd64.deb
-$(BRCM_SAI)_URL = "https://sonicstorage.blob.core.windows.net/packages/bcmsai/3.5/libsaibcm_3.5.3.1-15_amd64.deb?sv=2015-04-05&sr=b&sig=zXY%2FK%2FeGlxteIFlEkPdE%2FNDRet5T%2Fc1LgL0qyX9%2FmfQ%3D&se=2033-06-03T17%3A45%3A51Z&sp=r"
+LIBSAIBCM_XGS_VERSION = 12.1.0.2
+LIBSAIBCM_DNX_VERSION = 11.2.13.1-1
+LIBSAIBCM_XGS_BRANCH_NAME = SAI_12.1.0_GA
+LIBSAIBCM_DNX_BRANCH_NAME = SAI_11.2.0_GA
+LIBSAIBCM_XGS_URL_PREFIX = "https://sonicstorage.blob.core.windows.net/public/sai/sai-broadcom/$(LIBSAIBCM_XGS_BRANCH_NAME)/$(LIBSAIBCM_XGS_VERSION)/xgs"
+LIBSAIBCM_DNX_URL_PREFIX = "https://sonicstorage.blob.core.windows.net/public/sai/sai-broadcom/$(LIBSAIBCM_DNX_BRANCH_NAME)/$(LIBSAIBCM_DNX_VERSION)/dnx"
 
-BRCM_SAI_DEV = libsaibcm-dev_3.5.3.1-15_amd64.deb
-$(eval $(call add_derived_package,$(BRCM_SAI),$(BRCM_SAI_DEV)))
-$(BRCM_SAI_DEV)_URL = "https://sonicstorage.blob.core.windows.net/packages/bcmsai/3.5/libsaibcm-dev_3.5.3.1-15_amd64.deb?sv=2015-04-05&sr=b&sig=%2BYOVgRo6dLxv3sLb8JE1wLoD%2FneYDABadwFv5xH3XRE%3D&se=2033-06-03T17%3A46%3A14Z&sp=r"
+BRCM_XGS_SAI = libsaibcm_$(LIBSAIBCM_XGS_VERSION)_amd64.deb
+$(BRCM_XGS_SAI)_URL = "$(LIBSAIBCM_XGS_URL_PREFIX)/$(BRCM_XGS_SAI)"
+BRCM_XGS_SAI_DEV = libsaibcm-dev_$(LIBSAIBCM_XGS_VERSION)_amd64.deb
+$(eval $(call add_derived_package,$(BRCM_XGS_SAI),$(BRCM_XGS_SAI_DEV)))
+$(BRCM_XGS_SAI_DEV)_URL = "$(LIBSAIBCM_XGS_URL_PREFIX)/$(BRCM_XGS_SAI_DEV)"
 
-SONIC_ONLINE_DEBS += $(BRCM_SAI)
-$(BRCM_SAI_DEV)_DEPENDS += $(BRCM_SAI)
+# SAI module for DNX Asic family
+BRCM_DNX_SAI = libsaibcm_dnx_$(LIBSAIBCM_DNX_VERSION)_amd64.deb
+$(BRCM_DNX_SAI)_URL = "$(LIBSAIBCM_DNX_URL_PREFIX)/$(BRCM_DNX_SAI)"
+
+SONIC_ONLINE_DEBS += $(BRCM_XGS_SAI)
+SONIC_ONLINE_DEBS += $(BRCM_DNX_SAI)
+$(BRCM_XGS_SAI_DEV)_DEPENDS += $(BRCM_XGS_SAI)
+
+$(BRCM_XGS_SAI)_SKIP_VERSION=y
+$(BRCM_XGS_SAI_DEV)_SKIP_VERSION=y
+$(BRCM_DNX_SAI)_SKIP_VERSION=y
+
+$(eval $(call add_conflict_package,$(BRCM_XGS_SAI_DEV),$(LIBSAIVS_DEV)))

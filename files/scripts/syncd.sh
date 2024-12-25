@@ -1,95 +1,8 @@
 #!/bin/bash
 
-SERVICE="syncd"
-PEER="swss"
-DEBUGLOG="/tmp/swss-syncd-debug.log"
-LOCKFILE="/tmp/swss-syncd-lock"
+. /usr/local/bin/syncd_common.sh
 
-function debug()
-{
-    /usr/bin/logger $1
-    /bin/echo `date` "- $1" >> ${DEBUGLOG}
-}
-
-function lock_service_state_change()
-{
-    debug "Locking ${LOCKFILE} from ${SERVICE} service"
-
-    exec {LOCKFD}>${LOCKFILE}
-    /usr/bin/flock -x ${LOCKFD}
-    trap "/usr/bin/flock -u ${LOCKFD}" 0 2 3 15
-
-    debug "Locked ${LOCKFILE} (${LOCKFD}) from ${SERVICE} service"
-}
-
-function unlock_service_state_change()
-{
-    debug "Unlocking ${LOCKFILE} (${LOCKFD}) from ${SERVICE} service"
-    /usr/bin/flock -u ${LOCKFD}
-}
-
-function check_warm_boot()
-{
-    SYSTEM_WARM_START=`/usr/bin/redis-cli -n 6 hget "WARM_RESTART_ENABLE_TABLE|system" enable`
-    SERVICE_WARM_START=`/usr/bin/redis-cli -n 6 hget "WARM_RESTART_ENABLE_TABLE|${SERVICE}" enable`
-    # SYSTEM_WARM_START could be empty, always make WARM_BOOT meaningful.
-    if [[ x"$SYSTEM_WARM_START" == x"true" ]] || [[ x"$SERVICE_WARM_START" == x"true" ]]; then
-        WARM_BOOT="true"
-    else
-        WARM_BOOT="false"
-    fi
-}
-
-function wait_for_database_service()
-{
-    # Wait for redis server start before database clean
-    until [[ $(/usr/bin/docker exec database redis-cli ping | grep -c PONG) -gt 0 ]];
-        do sleep 1;
-    done
-
-    # Wait for configDB initialization
-    until [[ $(/usr/bin/docker exec database redis-cli -n 4 GET "CONFIG_DB_INITIALIZED") ]];
-        do sleep 1;
-    done
-}
-
-function getBootType()
-{
-    # same code snippet in files/build_templates/docker_image_ctl.j2
-    case "$(cat /proc/cmdline)" in
-    *SONIC_BOOT_TYPE=warm*)
-        TYPE='warm'
-        ;;
-    *SONIC_BOOT_TYPE=fastfast*)
-        TYPE='fastfast'
-        ;;
-    *SONIC_BOOT_TYPE=fast*|*fast-reboot*)
-        TYPE=$(awk '{ if ($1 <= 180) print "fast"; else print "cold" }' /proc/uptime)
-        ;;
-    *)
-        TYPE='cold'
-    esac
-    echo "${TYPE}"
-}
-
-start() {
-    debug "Starting ${SERVICE} service..."
-
-    lock_service_state_change
-
-    mkdir -p /host/warmboot
-
-    wait_for_database_service
-    check_warm_boot
-
-    debug "Warm boot flag: ${SERVICE} ${WARM_BOOT}."
-
-    if [[ x"$WARM_BOOT" == x"true" ]]; then
-        # Leave a mark for syncd scripts running inside docker.
-        touch /host/warmboot/warm-starting
-    else
-        rm -f /host/warmboot/warm-starting
-    fi
+function startplatform() {
 
     # platform specific tasks
 
@@ -106,16 +19,49 @@ start() {
                 /bin/systemctl stop pmon
                 debug "pmon is active while syncd starting, stop it first"
             fi
-            /usr/bin/hw-management.sh chipdown
         fi
 
-        if [[ x"$BOOT_TYPE" == x"fast" ]]; then
-            /usr/bin/hw-management.sh chipupdis
-        fi
+        debug "Starting Firmware update procedure"
+        /usr/bin/mst start --with_i2cdev
 
-        /usr/bin/mst start
-        /usr/bin/mlnx-fw-upgrade.sh
-        /etc/init.d/sxdkernel start
+        /usr/bin/mlnx-fw-upgrade.sh -c -v
+        if [[ "$?" -ne "${EXIT_SUCCESS}" ]]; then
+            debug "Failed to upgrade fw. " "$?" "Restart syncd"
+            exit 1
+        fi
+        /etc/init.d/sxdkernel restart
+        debug "Firmware update procedure ended"
+    fi
+
+    if [[ x"$sonic_asic_platform" == x"broadcom" ]]; then
+        if [[ x"$WARM_BOOT" != x"true" ]]; then
+            . /host/machine.conf
+            if [ -n "$aboot_platform" ]; then
+                platform=$aboot_platform
+            elif [ -n "$onie_platform" ]; then
+                platform=$onie_platform
+            else
+                platform="unknown"
+            fi
+            if [[ x"$platform" == x"x86_64-arista_720dt_48s" ]]; then
+                is_bcm0=$(ls /sys/class/net | grep bcm0)
+                if [[ "$is_bcm0" == "bcm0" ]]; then
+                    debug "stop SDK opennsl-modules ..."
+                    /etc/init.d/opennsl-modules stop
+                    debug "start SDK opennsl-modules ..."
+                    /etc/init.d/opennsl-modules start
+                    debug "started SDK opennsl-modules"
+                fi
+            fi
+        fi
+    fi
+
+    if [[ x"$sonic_asic_platform" == x"barefoot" ]]; then
+        is_usb0=$(ls /sys/class/net | grep usb0)
+        if [[ "$is_usb0" == "usb0" ]]; then
+            /usr/bin/ip link set usb0 down
+            /usr/bin/ip link set usb0 up
+        fi
     fi
 
     if [[ x"$WARM_BOOT" != x"true" ]]; then
@@ -124,34 +70,32 @@ start() {
         fi
     fi
 
-    # start service docker
-    /usr/bin/${SERVICE}.sh start
-    debug "Started ${SERVICE} service..."
-
-    unlock_service_state_change
+    if [[ x"$sonic_asic_platform" == x"nvidia-bluefield" ]]; then
+        /usr/bin/bfnet.sh start
+        if [[ $? != "0" ]]; then
+            debug "Failed to start Nvidia Bluefield"
+            exit 1
+        fi
+    fi
 }
 
-wait() {
+function waitplatform() {
+
+    BOOT_TYPE=`getBootType`
     if [[ x"$sonic_asic_platform" == x"mellanox" ]]; then
-        debug "Starting pmon service..."
-        /bin/systemctl start pmon
-        debug "Started pmon service"
+        PLATFORM=`$SONIC_DB_CLI CONFIG_DB hget 'DEVICE_METADATA|localhost' platform`
+        PMON_IMMEDIATE_START="/usr/share/sonic/device/$PLATFORM/pmon_immediate_start"
+        if [[ x"$BOOT_TYPE" = @(x"fast"|x"warm"|x"fastfast") ]] && [[ ! -f $PMON_IMMEDIATE_START ]]; then
+            debug "PMON service is delayed by for better fast/warm boot performance"
+        else
+            debug "Starting pmon service..."
+            /bin/systemctl start pmon
+            debug "Started pmon service"
+        fi
     fi
-    /usr/bin/${SERVICE}.sh wait
 }
 
-stop() {
-    debug "Stopping ${SERVICE} service..."
-
-    lock_service_state_change
-    check_warm_boot
-    debug "Warm boot flag: ${SERVICE} ${WARM_BOOT}."
-
-    if [[ x"$WARM_BOOT" == x"true" ]]; then
-        TYPE=warm
-    else
-        TYPE=cold
-    fi
+function stopplatform1() {
 
     if [[ x$sonic_asic_platform == x"mellanox" ]] && [[ x$TYPE == x"cold" ]]; then
         debug "Stopping pmon service ahead of syncd..."
@@ -160,21 +104,36 @@ stop() {
     fi
 
     if [[ x$sonic_asic_platform != x"mellanox" ]] || [[ x$TYPE != x"cold" ]]; then
-        debug "${TYPE} shutdown syncd process ..."
-        /usr/bin/docker exec -i syncd /usr/bin/syncd_request_shutdown --${TYPE}
+        # Invoke platform specific pre shutdown routine.
+        PLATFORM=`$SONIC_DB_CLI CONFIG_DB hget 'DEVICE_METADATA|localhost' platform`
+        PLATFORM_PRE_SHUTDOWN="/usr/share/sonic/device/$PLATFORM/plugins/syncd_request_pre_shutdown"
+        [ -f $PLATFORM_PRE_SHUTDOWN ] && \
+            /usr/bin/docker exec -i syncd$DEV /usr/share/sonic/platform/plugins/syncd_request_pre_shutdown --${TYPE}
 
-        # wait until syncd quits gracefully
-        while docker top syncd | grep -q /usr/bin/syncd; do
+        debug "${TYPE} shutdown syncd process ..."
+        /usr/bin/docker exec -i syncd$DEV /usr/bin/syncd_request_shutdown --${TYPE}
+
+        # wait until syncd quits gracefully or force syncd to exit after
+        # waiting for 20 seconds
+        start_in_secs=${SECONDS}
+        end_in_secs=${SECONDS}
+        timer_threshold=20
+        while docker top syncd$DEV | grep -q /usr/bin/syncd \
+                && [[ $((end_in_secs - start_in_secs)) -le $timer_threshold ]]; do
             sleep 0.1
+            end_in_secs=${SECONDS}
         done
 
-        /usr/bin/docker exec -i syncd /bin/sync
+        if [[ $((end_in_secs - start_in_secs)) -gt $timer_threshold ]]; then
+            debug "syncd process in container syncd$DEV did not exit gracefully"
+        fi
+
+        /usr/bin/docker exec -i syncd$DEV /bin/sync
         debug "Finished ${TYPE} shutdown syncd process ..."
     fi
+}
 
-    /usr/bin/${SERVICE}.sh stop
-    debug "Stopped ${SERVICE} service..."
-
+function stopplatform2() {
     # platform specific tasks
 
     if [[ x"$WARM_BOOT" != x"true" ]]; then
@@ -184,11 +143,27 @@ stop() {
         elif [ x$sonic_asic_platform == x'cavium' ]; then
             /etc/init.d/xpnet.sh stop
             /etc/init.d/xpnet.sh start
+        elif [ x"$sonic_asic_platform" == x"nvidia-bluefield" ]; then
+            /usr/bin/bfnet.sh stop
         fi
     fi
-
-    unlock_service_state_change
 }
+
+OP=$1
+DEV=$2
+
+SERVICE="syncd"
+PEER="swss"
+DEBUGLOG="/tmp/swss-syncd-debug$DEV.log"
+LOCKFILE="/tmp/swss-syncd-lock$DEV"
+NAMESPACE_PREFIX="asic"
+if [ "$DEV" ]; then
+    NET_NS="$NAMESPACE_PREFIX$DEV" #name of the network namespace
+    SONIC_DB_CLI="sonic-db-cli -n $NET_NS"
+else
+    NET_NS=""
+    SONIC_DB_CLI="sonic-db-cli"
+fi
 
 case "$1" in
     start|wait|stop)

@@ -31,7 +31,7 @@
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 #include <linux/jiffies.h>
-#include <linux/i2c/pmbus.h>
+#include <linux/pmbus.h>
 #include "pmbus.h"
 
 
@@ -1951,12 +1951,11 @@ static int pmbus_probe(struct i2c_client *client,
     return _pmbus_do_probe(client, id, info);
 }
 
-int _pmbus_do_remove(struct i2c_client *client)
+void _pmbus_do_remove(struct i2c_client *client)
 {
     struct pmbus_data *data = i2c_get_clientdata(client);
     hwmon_device_unregister(data->hwmon_dev);
     kfree(data->group.attrs);
-    return 0;
 }
 
 MODULE_DEVICE_TABLE(i2c, pmbus_id);

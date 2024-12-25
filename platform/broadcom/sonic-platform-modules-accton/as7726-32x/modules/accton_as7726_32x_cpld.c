@@ -498,6 +498,10 @@ static ssize_t show_status(struct device *dev, struct device_attribute *da,
     if (attr->index >= MODULE_PRESENT_1 && attr->index <= MODULE_PRESENT_34) {
         revert = 1;
     }
+    if (attr->index >= MODULE_RESET_1 && attr->index <= MODULE_RESET_32) {
+        revert = 1;
+    }
+    
 
     mutex_lock(&data->update_lock);
 	status = as7726_32x_cpld_read_internal(client, reg);
@@ -774,7 +778,7 @@ exit:
 	return ret;
 }
 
-static int as7726_32x_cpld_remove(struct i2c_client *client)
+static void as7726_32x_cpld_remove(struct i2c_client *client)
 {
     struct as7726_32x_cpld_data *data = i2c_get_clientdata(client);
     const struct attribute_group *group = NULL;
@@ -802,7 +806,6 @@ static int as7726_32x_cpld_remove(struct i2c_client *client)
 
     kfree(data);
 
-    return 0;
 }
 
 static int as7726_32x_cpld_read_internal(struct i2c_client *client, u8 reg)
